@@ -81,11 +81,26 @@ if check_password():
                 return "new"
         return "error"
 
-    # --- SZIGORÚ MODELLVÁLASZTÁS ÉS FELDOLGOZÓ ---
+    # --- DINAMIKUS MODELLVÁLASZTÁS ÉS FELDOLGOZÓ ---
     def process_document_with_gemini(uploaded_file):
-        # Szigorúan csak az 1.5-ös modelleket engedjük, amiknek nagy az ingyenes limitje (1500/nap)
-        # NEM engedjük a 2.5-ös modelleket, mert azoknak csak 20/nap a limitjük!
-        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+        # 1. Lekérdezzük, mid van valójában
+        try:
+            available_models = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        except Exception as e:
+            st.error(f"Hiba az elérhető modellek lekérdezésekor: {e}")
+            return None
+
+        # 2. Felállítunk egy fontossági sorrendet (megpróbáljuk a 1.5-öt, ha van, különben marad a 2.5)
+        preferred_order = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash']
+        models_to_try = [m for m in preferred_order if m in available_models]
+        
+        # Ha valamiért egyik preferált sincs a listádban, használjuk az elsőt, amit a Google ad
+        if not models_to_try:
+            if available_models:
+                models_to_try = [available_models[0]]
+            else:
+                st.error("Nincs elérhető generatív modell ehhez az API kulcshoz.")
+                return None
 
         prompt = """
         Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat JSON formátumban:
@@ -101,6 +116,7 @@ if check_password():
         """
         pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
         
+        # 3. Próbálkozás a modellekkel
         for model_name in models_to_try:
             try:
                 model = genai.GenerativeModel(model_name)
@@ -147,8 +163,7 @@ if check_password():
                 
                 progress_bar.progress((i + 1) / len(uploaded_files))
                 
-                # BIZTONSÁGI SZÜNET: 4 másodperc várakozás fájlonként
-                # Ez azért kell, hogy ne lépjük túl a Google "15 lekérdezés / perc" limitjét!
+                # BIZTONSÁGI SZÜNET
                 if i < len(uploaded_files) - 1:
                     time.sleep(4)
 
