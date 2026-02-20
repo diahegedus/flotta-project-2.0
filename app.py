@@ -62,7 +62,6 @@ if check_password():
         df = load_data()
         alvaz = new_data_dict.get("Alvazszam")
         
-        # Technikai mezők
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         new_data_dict["Utolso_Modositas_Ideje"] = now_str
         new_data_dict["Feldolgozasi_Statusz"] = "Kész"
@@ -82,15 +81,11 @@ if check_password():
                 return "new"
         return "error"
 
-    # --- OKOS MODELL ÉS DOKUMENTUM FELDOLGOZÓ ---
+    # --- SZIGORÚ MODELLVÁLASZTÁS ÉS FELDOLGOZÓ ---
     def process_document_with_gemini(uploaded_file):
-        try:
-            available_models = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        except:
-            available_models = ['gemini-1.5-flash']
-            
-        preferred_order = ['gemini-1.5-flash', 'gemini-1.5-pro']
-        models_to_try = [m for m in preferred_order if m in available_models] or [available_models[0]]
+        # Szigorúan csak az 1.5-ös modelleket engedjük, amiknek nagy az ingyenes limitje (1500/nap)
+        # NEM engedjük a 2.5-ös modelleket, mert azoknak csak 20/nap a limitjük!
+        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
 
         prompt = """
         Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat JSON formátumban:
@@ -113,7 +108,6 @@ if check_password():
                 clean_text = response.text.replace('```json', '').replace('```', '').strip()
                 return json.loads(clean_text)
             except Exception as e:
-                # Mostantól kiírja, ha hiba van, hogy lássuk mi az!
                 st.warning(f"⚠️ Hiba a(z) {uploaded_file.name} feldolgozásakor ({model_name}): {e}")
                 continue
         return None
@@ -153,9 +147,10 @@ if check_password():
                 
                 progress_bar.progress((i + 1) / len(uploaded_files))
                 
-                # BIZTONSÁGI SZÜNET: Hogy a Google ne tiltsa le a tömeges feltöltést!
+                # BIZTONSÁGI SZÜNET: 4 másodperc várakozás fájlonként
+                # Ez azért kell, hogy ne lépjük túl a Google "15 lekérdezés / perc" limitjét!
                 if i < len(uploaded_files) - 1:
-                    time.sleep(2)
+                    time.sleep(4)
 
             status_placeholder.success(f"Feldolgozás befejezve. Új rekord: {new_recs} | Frissített: {updated_recs} | Hiba: {errors}")
 
@@ -163,7 +158,6 @@ if check_password():
 
     # --- 2. SZEKCIÓ: NAPI ADATKÖZLŐ (REPORTING FLOW) ---
     st.subheader("📅 2. Napi Zárás és Adatközlő Export")
-    st.markdown("A mai napon feldolgozott, biztosító és BBO felé továbbítandó 'Kész' státuszú tételek kigyűjtése.")
     
     df_admin = load_data()
     today_str = datetime.now().strftime("%Y-%m-%d")
