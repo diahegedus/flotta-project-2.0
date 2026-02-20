@@ -4,6 +4,7 @@ import google.generativeai as genai
 import json
 import os
 import io
+import time
 from datetime import datetime
 
 # --- 1. HITELÉSÍTÉSI RENDSZER ---
@@ -61,10 +62,10 @@ if check_password():
         df = load_data()
         alvaz = new_data_dict.get("Alvazszam")
         
-        # Technikai mezők kitöltése
+        # Technikai mezők
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         new_data_dict["Utolso_Modositas_Ideje"] = now_str
-        new_data_dict["Feldolgozasi_Statusz"] = "Kész" # Később ide jöhet a 80%-os AI validációs logika
+        new_data_dict["Feldolgozasi_Statusz"] = "Kész"
 
         if alvaz and str(alvaz).lower() != "null":
             if alvaz in df["Alvazszam"].values:
@@ -81,27 +82,41 @@ if check_password():
                 return "new"
         return "error"
 
+    # --- OKOS MODELL ÉS DOKUMENTUM FELDOLGOZÓ ---
     def process_document_with_gemini(uploaded_file):
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            prompt = """
-            Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat JSON formátumban:
-            - Dokumentum_Tipus: "Forgalmi" vagy "Számla"
-            - Alvazszam: 17 karakteres VIN (Kritikus adat)
-            - Rendszam: Rendszám (ha szerepel)
-            - Vevo_Tulajdonos: Vevő neve vagy C.1 kód alatti név
-            - Elado: Eladó neve (csak számla esetén)
-            - Brutto_Vetelar: Bruttó végösszeg (csak számla esetén, számértékként)
-            - Teljesitmeny_kW (P.2), Hengerurtartalom_cm3 (P.1), Elso_forgalomba_helyezes (B)
-
-            Csak a nyers JSON-t add vissza, egyéb szöveg nélkül.
-            """
-            pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
-            response = model.generate_content([prompt, pdf_part])
-            clean_text = response.text.replace('```json', '').replace('```', '').strip()
-            return json.loads(clean_text)
+            available_models = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         except:
-            return None
+            available_models = ['gemini-1.5-flash']
+            
+        preferred_order = ['gemini-1.5-flash', 'gemini-1.5-pro']
+        models_to_try = [m for m in preferred_order if m in available_models] or [available_models[0]]
+
+        prompt = """
+        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat JSON formátumban:
+        - Dokumentum_Tipus: "Forgalmi" vagy "Számla"
+        - Alvazszam: 17 karakteres VIN (Kritikus adat)
+        - Rendszam: Rendszám (ha szerepel)
+        - Vevo_Tulajdonos: Vevő neve vagy C.1 kód alatti név
+        - Elado: Eladó neve (csak számla esetén)
+        - Brutto_Vetelar: Bruttó végösszeg (csak számla esetén, számértékként)
+        - Teljesitmeny_kW (P.2), Hengerurtartalom_cm3 (P.1), Elso_forgalomba_helyezes (B)
+
+        Csak a nyers JSON-t add vissza, egyéb szöveg nélkül.
+        """
+        pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
+        
+        for model_name in models_to_try:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content([prompt, pdf_part])
+                clean_text = response.text.replace('```json', '').replace('```', '').strip()
+                return json.loads(clean_text)
+            except Exception as e:
+                # Mostantól kiírja, ha hiba van, hogy lássuk mi az!
+                st.warning(f"⚠️ Hiba a(z) {uploaded_file.name} feldolgozásakor ({model_name}): {e}")
+                continue
+        return None
 
     # --- FELÜLET ---
     st.title("🚗 Flotta Admin: Master Data & Napi Riport")
@@ -125,7 +140,7 @@ if check_password():
             new_recs, updated_recs, errors = 0, 0, 0
 
             for i, file in enumerate(uploaded_files):
-                status_placeholder.text(f"Fájl feldolgozása: {file.name}")
+                status_placeholder.text(f"Fájl feldolgozása ({i+1}/{len(uploaded_files)}): {file.name}")
                 data = process_document_with_gemini(file)
                 
                 if data:
@@ -137,6 +152,10 @@ if check_password():
                     errors += 1
                 
                 progress_bar.progress((i + 1) / len(uploaded_files))
+                
+                # BIZTONSÁGI SZÜNET: Hogy a Google ne tiltsa le a tömeges feltöltést!
+                if i < len(uploaded_files) - 1:
+                    time.sleep(2)
 
             status_placeholder.success(f"Feldolgozás befejezve. Új rekord: {new_recs} | Frissített: {updated_recs} | Hiba: {errors}")
 
@@ -150,20 +169,16 @@ if check_password():
     today_str = datetime.now().strftime("%Y-%m-%d")
     
     if not df_admin.empty:
-        # Szűrés a mai napra módosított adatokra
-        # (Biztosítjuk, hogy a NaN értékeket is lekezeljük string műveletnél)
         df_admin['Utolso_Modositas_Ideje'] = df_admin['Utolso_Modositas_Ideje'].fillna('')
         df_daily = df_admin[df_admin["Utolso_Modositas_Ideje"].str.startswith(today_str)]
         
         if not df_daily.empty:
             st.info(f"Ma feldolgozott és rögzített tételek száma: **{len(df_daily)} db**")
             
-            # Adatközlő Excel generálása
             output_daily = io.BytesIO()
             with pd.ExcelWriter(output_daily, engine='openpyxl') as writer:
                 df_daily.to_excel(writer, index=False, sheet_name='Napi_Betoltes')
             
-            # Dátumozott fájlnév (pl. Biztosito_Betoltes_20260220.xlsx)
             file_date = today_str.replace("-", "")
             
             st.download_button(
@@ -171,16 +186,16 @@ if check_password():
                 data=output_daily.getvalue(),
                 file_name=f'Biztosito_Betoltes_{file_date}.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                type="primary" # Kiemelt gomb
+                type="primary"
             )
         else:
-            st.info("Ma még nem történt dokumentum-feldolgozás, nincs mit jelenteni.")
+            st.info("Ma még nem történt dokumentum-feldolgozás.")
     else:
         st.info("A Master Data adatbázis még üres.")
 
     st.divider()
     
-    # --- 3. SZEKCIÓ: MASTER DATA MEGJELENÍTÉSE ---
+    # --- 3. SZEKCIÓ: MASTER DATA ---
     with st.expander("🗄️ Teljes Master Data (Központi Járműnyilvántartás) megtekintése"):
         if not df_admin.empty:
             st.dataframe(df_admin, use_container_width=True, hide_index=True)
