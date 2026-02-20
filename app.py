@@ -34,16 +34,17 @@ def check_password():
         return True
 
 if check_password():
-    # --- BEÁLLÍTÁSOK ---
+    # --- BEÁLLÍTÁSOK ÉS AI KONFIGURÁCIÓ ---
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=api_key)
     except KeyError:
-        st.error("❌ API kulcs hiányzik a Secrets-ből!")
+        st.error("❌ API kulcs nem található a Secrets-ben!")
         st.stop()
 
     DB_FILE = "forgalmi_adatbazis.csv"
 
+    # --- SEGÉDFÜGGVÉNYEK ---
     def load_data():
         if os.path.exists(DB_FILE):
             return pd.read_csv(DB_FILE)
@@ -62,6 +63,7 @@ if check_password():
             if alvaz in df["Alvazszam"].values:
                 idx = df.index[df['Alvazszam'] == alvaz][0]
                 for key, value in new_data_dict.items():
+                    # Csak akkor írjuk felül, ha az új adat nem üres
                     if value and str(value).lower() != "null": 
                         df.at[idx, key] = value
                 save_data(df)
@@ -74,53 +76,73 @@ if check_password():
         return "error"
 
     def process_document_with_gemini(uploaded_file):
+        # Automatikus modellválasztás a Google válasza alapján
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            prompt = """
-            Elemezd a PDF-et (forgalmi vagy számla). Keresd meg:
-            - Dokumentum_Tipus: "Forgalmi" vagy "Számla"
-            - Alvazszam: 17 karakteres VIN (Kritikus!)
-            - Rendszam: Ha van
-            - Vevo_Tulajdonos: Vevő neve vagy C.1 kód alatti név
-            - Elado: Csak számla esetén
-            - Brutto_Vetelar: Csak számla esetén (csak a számérték)
-            - Teljesitmeny_kW (P.2), Hengerurtartalom_cm3 (P.1), Elso_forgalomba_helyezes (B)
-
-            Csak nyers JSON-t adj vissza!
-            """
-            pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
-            response = model.generate_content([prompt, pdf_part])
-            clean_text = response.text.replace('```json', '').replace('```', '').strip()
-            return json.loads(clean_text)
+            available_models = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         except:
-            return None
+            available_models = ['gemini-1.5-flash', 'gemini-1.5-pro']
+            
+        preferred_order = ['gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-1.5-pro-latest']
+        models_to_try = [m for m in preferred_order if m in available_models] or [available_models[0]]
+
+        prompt = """
+        Te egy profi flotta adminisztrációs rendszer vagy. Elemezd a csatolt PDF-et (amely forgalmi engedély vagy adásvételi számla).
+        Keresd meg és add vissza szigorúan csak JSON formátumban:
+        
+        - Dokumentum_Tipus: "Forgalmi" vagy "Számla"
+        - Alvazszam: 17 karakteres alvázszám (VIN)
+        - Rendszam: Forgalmi rendszám (ha van)
+        - Vevo_Tulajdonos: Számla esetén a Vevő, forgalmi esetén a Tulajdonos (C.1)
+        - Elado: Számla esetén az Eladó neve (egyébként null)
+        - Brutto_Vetelar: Számla esetén a bruttó végösszeg (csak a számérték, egyébként null)
+        - Teljesitmeny_kW: Forgalmi P.2 kód
+        - Hengerurtartalom_cm3: Forgalmi P.1 kód
+        - Elso_forgalomba_helyezes: Forgalmi B kód (YYYY.MM.DD)
+
+        Csak a nyers JSON-t írd le, minden más szöveg nélkül!
+        """
+        
+        pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
+        
+        for model_name in models_to_try:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content([prompt, pdf_part])
+                clean_text = response.text.replace('```json', '').replace('```', '').strip()
+                return json.loads(clean_text)
+            except Exception as e:
+                continue # Ha hiba van, megy a következő modellre
+        return None
 
     # --- FELÜLET ---
-    st.title("🚗 Flotta Admin: Tömeges Adatkinyerő")
+    st.title("📄 Flotta Admin: Tömeges Adatkinyerő Pilot")
+    st.markdown("Dokumentumok (forgalmi engedélyek és számlák) automatikus feldolgozása és összefűzése alvázszám alapján.")
     
+    # Oldalsáv kijelentkezéssel
     with st.sidebar:
-        st.write(f"👤 Felhasználó: {st.secrets['credentials']['username']}")
+        st.write(f"Bejelentkezve: **{st.secrets['credentials']['username']}**")
         if st.button("Kijelentkezés"):
             if "password_correct" in st.session_state:
                 del st.session_state["password_correct"]
             st.rerun()
 
     # TÖMEGES FELTÖLTÉS
-    uploaded_files = st.file_uploader("Dokumentumok feltöltése (PDF)", type=['pdf'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("PDF dokumentumok feltöltése", type=['pdf'], accept_multiple_files=True)
 
     if uploaded_files:
-        if st.button(f"{len(uploaded_files)} fájl feldolgozása", type="primary", use_container_width=True):
+        if st.button(f"{len(uploaded_files)} dokumentum feldolgozásának indítása", type="primary", use_container_width=True):
             progress_bar = st.progress(0)
             status_text = st.empty()
             
             new_count, update_count, error_count = 0, 0, 0
 
             for i, file in enumerate(uploaded_files):
-                status_text.text(f"Feldolgozás: {file.name}")
-                result_data = process_document_with_gemini(file)
+                status_text.text(f"Feldolgozás alatt ({i+1}/{len(uploaded_files)}): {file.name}")
                 
-                if result_data:
-                    res = upsert_record(result_data)
+                extracted_data = process_document_with_gemini(file)
+                
+                if extracted_data:
+                    res = upsert_record(extracted_data)
                     if res == "new": new_count += 1
                     elif res == "update": update_count += 1
                     else: error_count += 1
@@ -129,28 +151,26 @@ if check_password():
                 
                 progress_bar.progress((i + 1) / len(uploaded_files))
 
-            status_text.success(f"Kész! ✨ Új: {new_count} | Frissítve: {update_count} | Hiba: {error_count}")
-            st.balloons()
+            status_text.success(f"Feldolgozás befejezve! Eredmény: {new_count} új rögzítve | {update_count} frissítve | {error_count} hiba")
 
     st.divider()
     
+    # --- ADATBÁZIS NÉZET ---
     st.subheader("📊 Központi Járműnyilvántartás")
     df_admin = load_data()
     
     if not df_admin.empty:
-        # Megjelenítés
         st.dataframe(df_admin, use_container_width=True, hide_index=True)
         
-        # Excel export
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        db_output = io.BytesIO()
+        with pd.ExcelWriter(db_output, engine='openpyxl') as writer:
             df_admin.to_excel(writer, index=False, sheet_name='Flotta_Lista')
         
         st.download_button(
-            label="📥 Teljes adatbázis letöltése (.xlsx)",
-            data=output.getvalue(),
+            label="📥 Teljes adatbázis letöltése (Excel)",
+            data=db_output.getvalue(),
             file_name='flotta_nyilvantartas.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
     else:
-        st.info("Az adatbázis jelenleg üres.")
+        st.info("Az adatbázis jelenleg üres. Tölts fel dokumentumokat a kezdéshez.")
