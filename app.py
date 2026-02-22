@@ -59,7 +59,6 @@ if check_password():
     ]
     CONF_FIELDS = [f"{f}_Conf" for f in EXPECTED_FIELDS]
 
-    # ÜZLETI SÚLYOK A SMART SCORING-HOZ
     WEIGHTS = {
         "Alvazszam": 3,
         "Dokumentum_Tipus": 2,
@@ -68,7 +67,7 @@ if check_password():
     }
 
     # =========================================================
-    # SQLITE ADATBÁZIS RÉTEG
+    # SQLITE ADATBÁZIS RÉTEG (JAVÍTOTT OLVASÁSSAL)
     # =========================================================
     def init_db():
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -92,6 +91,14 @@ if check_password():
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         df = pd.read_sql_query("SELECT * FROM masterdata", conn)
         conn.close()
+        
+        # BIZTONSÁGI JAVÍTÁS: Minden szöveges oszlopot garantáltan szöveggé alakítunk a Pandasban,
+        # így az üres cellák ("NaN") miatt soha többé nem lesz AttributeError!
+        string_cols = ["Hiba_Oka", "Feldolgozasi_Statusz", "Utolso_Modositas_Ideje", "Dokumentum_Tipus"]
+        for col in string_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna("").astype(str)
+                
         return df
 
     def upsert_record(new_data_dict):
@@ -129,17 +136,16 @@ if check_password():
         return status
 
     # =========================================================
-    # VALIDÁCIÓS RÉTEG (SÚLYOZOTT SMART SCORING)
+    # VALIDÁCIÓS RÉTEG
     # =========================================================
     def validate_ocr_output(data):
         errors = []
         if not data: return False, "Nem valid JSON / AI hiba", 0
 
-        # Súlyozott átlag számítása
         weighted_sum = 0
         total_weight = 0
         for f in EXPECTED_FIELDS:
-            w = WEIGHTS.get(f, 1) # Alapértelmezett súly 1
+            w = WEIGHTS.get(f, 1)
             conf_val = data.get(f"{f}_Conf", 0)
             if isinstance(conf_val, (int, float)):
                 weighted_sum += (conf_val * w)
@@ -147,7 +153,6 @@ if check_password():
         
         avg_score = (weighted_sum / total_weight) if total_weight > 0 else 0
 
-        # AI Self-Reflection: Minőségellenőrzés
         if data.get("low_quality_document") is True:
             errors.append("AI Jelzése: Gyenge minőségű/olvashatatlan kép!")
             avg_score -= 15
@@ -177,7 +182,7 @@ if check_password():
         return True, "", final_score
 
     # =========================================================
-    # AI KINYERÉS (REGEX JSON + SELF REFLECTION)
+    # AI KINYERÉS (HIBÁK LEMENTÉSÉVEL!)
     # =========================================================
     def process_document_with_gemini(uploaded_file):
         models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
@@ -187,20 +192,29 @@ if check_password():
         EXTRA: Ha a dokumentum nagyon rossz minőségű, homályos vagy nehezen olvasható, állítsd be a "low_quality_document": true értéket a gyökérszinten!
         
         Kinyerendő mezők: Dokumentum_Tipus, Alvazszam, Rendszam, Vevo_Tulajdonos, Elado, Brutto_Vetelar, Teljesitmeny_kW, Hengerurtartalom_cm3, Elso_forgalomba_helyezes.
+        Csak és kizárólag a nyers JSON-t add vissza!
         """
         pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
         
+        last_error = ""
         for model_name in models_to_try:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content([prompt, pdf_part])
                 
-                # STABIL JSON EXTRACT REGEX-szel
-                json_match = re.search(r"\{.*\}", response.text, re.DOTALL)
+                try:
+                    raw_text = response.text
+                except Exception as text_e:
+                    raise ValueError(f"AI nem adott vissza szöveget (Biztonsági blokkolás?): {text_e}")
+
+                clean_text = raw_text.replace('```json', '').replace('```', '').strip()
+                
+                # Megengedőbb JSON keresés
+                json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
                 if json_match:
                     raw_json = json.loads(json_match.group(0))
                 else:
-                    raise ValueError("No JSON found in AI response")
+                    raw_json = json.loads(clean_text)
                 
                 flat_data = {"low_quality_document": raw_json.get("low_quality_document", False)}
                 for field in EXPECTED_FIELDS:
@@ -211,10 +225,15 @@ if check_password():
                     else:
                         flat_data[field] = raw_json.get(field)
                         flat_data[f"{field}_Conf"] = 0
-                return flat_data
+                        
+                return flat_data, "" # Sikeres lefutás
+                
             except Exception as e:
+                last_error = str(e)
                 continue
-        return None
+                
+        # Ha ide eljut, egyik modell sem sikerült. Visszaadjuk a pontos hibaüzenetet!
+        return None, f"AI Rendszerhiba: {last_error}"
 
     # =========================================================
     # OLDALSÁV (KÖZÖS)
@@ -231,7 +250,7 @@ if check_password():
             st.rerun()
 
     # =========================================================
-    # FELDOLGOZÓ PIPELINE (SZIMULÁLT QUEUE LOGIKA)
+    # FELDOLGOZÓ PIPELINE
     # =========================================================
     def run_processing_pipeline(uploaded_files):
         progress_bar = st.progress(0)
@@ -240,7 +259,9 @@ if check_password():
 
         for i, file in enumerate(uploaded_files):
             status_placeholder.text(f"Státusz: OCR_Feldolgozás_Alatt - {file.name}")
-            extracted_data = process_document_with_gemini(file)
+            
+            # FIGYELEM: Most már két értéket kapunk vissza!
+            extracted_data, ai_error_message = process_document_with_gemini(file)
             
             if extracted_data:
                 is_valid, error_reason, conf_score = validate_ocr_output(extracted_data)
@@ -257,10 +278,16 @@ if check_password():
                 elif status == "upserted": updated_recs += 1
             else:
                 critical_errors += 1
-                upsert_record({"Dokumentum_Tipus": "Ismeretlen", "Feldolgozasi_Statusz": "Hiba", "Hiba_Oka": "Nem valid JSON / AI hiba", "Confidence_Score": 0})
+                # Lementjük a VALÓDI AI hibát a generikus helyett!
+                upsert_record({
+                    "Dokumentum_Tipus": "Ismeretlen", 
+                    "Feldolgozasi_Statusz": "Hiba", 
+                    "Hiba_Oka": ai_error_message, 
+                    "Confidence_Score": 0
+                })
             
             progress_bar.progress((i + 1) / len(uploaded_files))
-            if i < len(uploaded_files) - 1: time.sleep(1) # Rate limit védelem
+            if i < len(uploaded_files) - 1: time.sleep(1)
 
         success_msg = f"Feldolgozás befejezve! Új/Frissített: {new_recs + updated_recs} | Kritikus Hiba: {critical_errors}"
         if validation_fails > 0 or critical_errors > 0:
@@ -294,14 +321,14 @@ if check_password():
                     disp_cols = [c for c in ["Alvazszam", "Alvazszam_Conf", "Rendszam", "Rendszam_Conf", "Brutto_Vetelar", "Brutto_Vetelar_Conf", "Hiba_Oka"] if c in df_errors.columns]
                     st.dataframe(df_errors[disp_cols].sort_values(by="Alvazszam_Conf", ascending=True), use_container_width=True, hide_index=True)
             with tab2:
-                df_missing = df_errors[df_errors["Hiba_Oka"].astype(str).str.contains("Hiányzó|Érvénytelen|Minőség", na=False, case=False)]
+                # Nincs több AttributeError, mert a load_data() stringgé alakította!
+                df_missing = df_errors[df_errors["Hiba_Oka"].str.contains("Hiányzó|Érvénytelen|Minőség", na=False, case=False)]
                 if not df_missing.empty: st.dataframe(df_missing[["Alvazszam", "Dokumentum_Tipus", "Hiba_Oka", "Confidence_Score"]], use_container_width=True, hide_index=True)
             with tab3:
-                df_json = df_errors[df_errors["Feldolgozasi_Statusz"].astype(str) == "Hiba"]
+                df_json = df_errors[df_errors["Feldolgozasi_Statusz"] == "Hiba"]
                 if not df_json.empty: st.dataframe(df_json[["Alvazszam", "Feldolgozasi_Statusz", "Hiba_Oka"]], use_container_width=True, hide_index=True)
             with tab4:
-                # FIELD FAILURE RATE (Melyik mező bukik el a legtöbbször?)
-                st.markdown("Az alábbi táblázat mutatja, hogy **az összes dokumentum hány százalékánál** volt az adott mező AI magabiztossága 80% alatt. Segít a prompt optimalizálásban!")
+                st.markdown("Az alábbi táblázat mutatja, hogy **az összes dokumentum hány százalékánál** volt az adott mező AI magabiztossága 80% alatt.")
                 failure_rates = []
                 for f in EXPECTED_FIELDS:
                     if f"{f}_Conf" in df_admin.columns:
@@ -335,11 +362,8 @@ if check_password():
                 st.error(f"⚠️ {len(df_pending)} tétel manuális javításra szorul!")
                 st.info("Kattints duplán a táblázat celláira a hibás adat javításához! Pipáld be a **Jóváhagyás** oszlopot, majd kattints a Mentés gombra!")
                 
-                # Zavaró AI oszlopok eltávolítása a szerkesztőből
                 cols_to_drop = [c for c in df_pending.columns if c.endswith("_Conf") or c in ["Confidence_Score", "Feltolto_User", "Utolso_Modositas_Ideje"]]
                 df_editable = df_pending.drop(columns=cols_to_drop, errors='ignore')
-                
-                # Jóváhagyás checkbox hozzáadása
                 df_editable.insert(0, "Jóváhagyás", False)
                 
                 edited_df = st.data_editor(df_editable, hide_index=True, use_container_width=True, key="data_editor")
@@ -370,9 +394,7 @@ if check_password():
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         if not df_admin.empty:
-            df_admin['Utolso_Modositas_Ideje'] = df_admin['Utolso_Modositas_Ideje'].astype(str).replace('nan', '')
             df_daily = df_admin[(df_admin["Utolso_Modositas_Ideje"].str.startswith(today_str)) & (df_admin["Feldolgozasi_Statusz"] == "Kész")]
-            
             cols_to_drop = [c for c in df_daily.columns if c.endswith("_Conf") or c == "Confidence_Score"]
             df_daily_clean = df_daily.drop(columns=cols_to_drop, errors='ignore')
             
@@ -400,7 +422,7 @@ if check_password():
         if not df_all.empty:
             df_client = df_all[df_all["Feltolto_User"] == current_user]
             if not df_client.empty:
-                display_cols = ["Alvazszam", "Dokumentum_Tipus", "Feldolgozasi_Statusz"]
+                display_cols = ["Alvazszam", "Dokumentum_Tipus", "Feldolgozasi_Statusz", "Hiba_Oka"]
                 st.dataframe(df_client[display_cols], use_container_width=True, hide_index=True)
             else:
                 st.info("Még nem töltött fel dokumentumot.")
