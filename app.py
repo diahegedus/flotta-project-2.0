@@ -92,7 +92,6 @@ if check_password():
         df = pd.read_sql_query("SELECT * FROM masterdata", conn)
         conn.close()
         
-        # BIZTONSÁGI JAVÍTÁS: Minden szöveges oszlop garantáltan String lesz
         string_cols = ["Hiba_Oka", "Feldolgozasi_Statusz", "Utolso_Modositas_Ideje", "Dokumentum_Tipus"]
         for col in string_cols:
             if col in df.columns:
@@ -209,7 +208,6 @@ if check_password():
             try:
                 model = genai.GenerativeModel(model_name)
                 
-                # STRICT JSON KÉNYSZERÍTÉS API SZINTEN
                 response = model.generate_content(
                     [prompt, pdf_part],
                     generation_config=genai.GenerationConfig(response_mime_type="application/json")
@@ -218,7 +216,7 @@ if check_password():
                 try:
                     raw_text = response.text
                 except Exception as text_e:
-                    raise ValueError(f"AI nem adott vissza szöveget (Biztonsági blokkolás?): {text_e}")
+                    raise ValueError(f"AI nem adott vissza szöveget: {text_e}")
 
                 raw_json = json.loads(raw_text)
                 
@@ -232,7 +230,7 @@ if check_password():
                         flat_data[field] = raw_json.get(field)
                         flat_data[f"{field}_Conf"] = 0
                         
-                return flat_data, "" # Sikeres lefutás
+                return flat_data, ""
                 
             except Exception as e:
                 last_error = str(e)
@@ -270,6 +268,11 @@ if check_password():
             if extracted_data:
                 is_valid, error_reason, conf_score = validate_ocr_output(extracted_data)
                 extracted_data["Confidence_Score"] = conf_score
+                
+                # --- A JAVÍTÁS ITT VAN! ---
+                # A "low_quality_document" flag-re már nincs szükségünk a mentéshez, kidobjuk!
+                if "low_quality_document" in extracted_data:
+                    del extracted_data["low_quality_document"]
                 
                 if is_valid:
                     extracted_data["Feldolgozasi_Statusz"] = "Kész"; extracted_data["Hiba_Oka"] = ""
