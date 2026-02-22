@@ -7,23 +7,38 @@ import io
 import time
 import sqlite3
 import re
+import bcrypt
 from datetime import datetime
 
 # =========================================================
-# 1. HITELÉSÍTÉSI RENDSZER (3 SZEREPKÖRREL)
+# 1. BIZTONSÁGOS HITELÉSÍTÉSI RENDSZER (BCRYPT)
 # =========================================================
 def check_password():
     def password_entered():
         user = st.session_state["username"]
         pwd = st.session_state["password"]
+        
         if "users" in st.secrets and user in st.secrets["users"]:
-            if st.secrets["users"][user]["password"] == pwd:
+            stored_secret = st.secrets["users"][user]["password"]
+            
+            # Enterprise szintű Bcrypt validáció (Graceful fallbackkel a demóhoz)
+            is_valid = False
+            try:
+                if bcrypt.checkpw(pwd.encode('utf-8'), stored_secret.encode('utf-8')):
+                    is_valid = True
+            except ValueError:
+                # Ha a secrets.toml-ben még sima szöveg van (nem hash), átmenetileg elfogadjuk
+                if pwd == stored_secret:
+                    is_valid = True
+
+            if is_valid:
                 st.session_state["password_correct"] = True
                 st.session_state["logged_in_user"] = user
                 st.session_state["role"] = st.secrets["users"][user]["role"]
                 del st.session_state["password"]
                 del st.session_state["username"]
                 return
+                
         st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
@@ -67,40 +82,63 @@ if check_password():
     }
 
     # =========================================================
-    # SQLITE ADATBÁZIS RÉTEG
+    # SQLITE ADATBÁZIS RÉTEG (WAL MÓD + AUDIT TABLE)
     # =========================================================
+    def get_db_connection():
+        """Stabil, párhuzamosítást tűrő adatbázis kapcsolat."""
+        conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
     def init_db():
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # 1. Fő tábla létrehozása
         columns = [
             "Alvazszam TEXT PRIMARY KEY", "Rendszam TEXT", "Vevo_Tulajdonos TEXT", 
             "Elado TEXT", "Brutto_Vetelar TEXT", "Teljesitmeny_kW TEXT", 
             "Hengerurtartalom_cm3 TEXT", "Elso_forgalomba_helyezes TEXT",
             "Dokumentum_Tipus TEXT", "Feldolgozasi_Statusz TEXT", 
             "Utolso_Modositas_Ideje TEXT", "Feltolto_User TEXT", 
-            "Hiba_Oka TEXT", "Confidence_Score REAL"
+            "Hiba_Oka TEXT", "Confidence_Score REAL", "Modosito_User TEXT"
         ]
         columns.extend([f"{f} REAL" for f in CONF_FIELDS])
         cursor.execute(f"CREATE TABLE IF NOT EXISTS masterdata ({', '.join(columns)})")
+        
+        try: cursor.execute("ALTER TABLE masterdata ADD COLUMN Modosito_User TEXT")
+        except sqlite3.OperationalError: pass
+        
+        # 2. AUDIT TÁBLA LÉTREHOZÁSA (Compliance-ready)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS masterdata_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                Alvazszam TEXT,
+                Field_Name TEXT,
+                Old_Value TEXT,
+                New_Value TEXT,
+                Modified_By TEXT,
+                Timestamp TEXT
+            )
+        """)
+        
         conn.commit()
         conn.close()
 
     init_db()
 
     def load_data():
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn = get_db_connection()
         df = pd.read_sql_query("SELECT * FROM masterdata", conn)
         conn.close()
-        
-        string_cols = ["Hiba_Oka", "Feldolgozasi_Statusz", "Utolso_Modositas_Ideje", "Dokumentum_Tipus"]
+        string_cols = ["Hiba_Oka", "Feldolgozasi_Statusz", "Utolso_Modositas_Ideje", "Dokumentum_Tipus", "Modosito_User"]
         for col in string_cols:
             if col in df.columns:
                 df[col] = df[col].fillna("").astype(str)
-                
         return df
 
     def upsert_record(new_data_dict):
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         alvaz = new_data_dict.get("Alvazszam")
@@ -108,21 +146,43 @@ if check_password():
             alvaz = f"ISMERETLEN_{int(time.time())}"
             new_data_dict["Alvazszam"] = alvaz
             
-        new_data_dict["Utolso_Modositas_Ideje"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_user = st.session_state["logged_in_user"]
+        
+        new_data_dict["Utolso_Modositas_Ideje"] = timestamp_now
         if "Feltolto_User" not in new_data_dict:
-            new_data_dict["Feltolto_User"] = st.session_state["logged_in_user"]
+            new_data_dict["Feltolto_User"] = current_user
 
         clean_dict = {k: (str(v) if isinstance(v, (dict, list)) else v) for k, v in new_data_dict.items() if v is not None}
-        cols = list(clean_dict.keys())
-        vals = [clean_dict[c] for c in cols]
-        
-        placeholders = ", ".join(["?"] * len(cols))
-        col_names = ", ".join(cols)
-        update_clause = ", ".join([f"{c} = excluded.{c}" for c in cols if c != "Alvazszam"])
-        
-        sql = f"INSERT INTO masterdata ({col_names}) VALUES ({placeholders}) ON CONFLICT(Alvazszam) DO UPDATE SET {update_clause}"
         
         try:
+            # --- AUDIT LOGIKA: Lekérdezzük a régi adatot UPSERT előtt ---
+            cursor.execute("SELECT * FROM masterdata WHERE Alvazszam=?", (alvaz,))
+            existing_row = cursor.fetchone()
+            
+            if existing_row:
+                col_names_db = [description[0] for description in cursor.description]
+                existing_dict = dict(zip(col_names_db, existing_row))
+                
+                # Összehasonlítjuk és naplózzuk a változásokat
+                for k, new_v in clean_dict.items():
+                    old_v = existing_dict.get(k)
+                    # Kihagyjuk a technikai metaadatokat az auditból
+                    if k not in ["Utolso_Modositas_Ideje", "Feltolto_User", "Modosito_User"] and str(old_v) != str(new_v):
+                        cursor.execute("""
+                            INSERT INTO masterdata_audit 
+                            (Alvazszam, Field_Name, Old_Value, New_Value, Modified_By, Timestamp) 
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (alvaz, k, str(old_v), str(new_v), current_user, timestamp_now))
+
+            # --- VALÓDI UPSERT ---
+            cols = list(clean_dict.keys())
+            vals = [clean_dict[c] for c in cols]
+            placeholders = ", ".join(["?"] * len(cols))
+            col_names = ", ".join(cols)
+            update_clause = ", ".join([f"{c} = excluded.{c}" for c in cols if c != "Alvazszam"])
+            
+            sql = f"INSERT INTO masterdata ({col_names}) VALUES ({placeholders}) ON CONFLICT(Alvazszam) DO UPDATE SET {update_clause}"
             cursor.execute(sql, vals)
             conn.commit()
             status = "upserted"
@@ -131,10 +191,11 @@ if check_password():
             status = "error"
         finally:
             conn.close()
+            
         return status
 
     # =========================================================
-    # VALIDÁCIÓS RÉTEG (SÚLYOZOTT SMART SCORING)
+    # VALIDÁCIÓS RÉTEG (PRO VIN REGEX + SMART SCORING)
     # =========================================================
     def validate_ocr_output(data):
         errors = []
@@ -163,9 +224,13 @@ if check_password():
         if not alvaz or str(alvaz).lower() == "null":
             errors.append("Hiányzó Alvázszám"); avg_score -= 40; data["Alvazszam_Conf"] = 0
         else:
-            clean_alvaz = str(alvaz).replace(" ", "").replace("-", "")
-            if len(clean_alvaz) != 17:
-                errors.append(f"Érvénytelen VIN ({len(clean_alvaz)} kar.)"); avg_score -= 40; data["Alvazszam_Conf"] = 0
+            # PROFESSIONAL VIN REGEX (17 karakter, nincs I, O, Q)
+            clean_alvaz = str(alvaz).upper().replace(" ", "").replace("-", "")
+            VIN_REGEX = r"^[A-HJ-NPR-Z0-9]{17}$"
+            if not re.match(VIN_REGEX, clean_alvaz):
+                errors.append(f"Érvénytelen VIN formátum ({clean_alvaz})")
+                avg_score -= 40
+                data["Alvazszam_Conf"] = 0
 
         if str(doc_type).lower() == "számla":
             vetelar = data.get("Brutto_Vetelar")
@@ -180,7 +245,7 @@ if check_password():
         return True, "", final_score
 
     # =========================================================
-    # AI KINYERÉS (CACHE-ELT MODELL LISTA + STRICT JSON)
+    # AI KINYERÉS (ULTRA STABIL JSON EXTRACT)
     # =========================================================
     @st.cache_data(ttl=3600)
     def get_best_models():
@@ -193,12 +258,10 @@ if check_password():
 
     def process_document_with_gemini(uploaded_file):
         models_to_try = get_best_models()
-        
         prompt = """
-        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat!
+        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat szigorúan JSON struktúrában!
         Minden mezőhöz kötelezően meg kell adnod egy "value" (érték) és egy "confidence" (0-100) párost.
         EXTRA: Ha a dokumentum nagyon rossz minőségű, homályos vagy nehezen olvasható, állítsd be a "low_quality_document": true értéket a gyökérszinten!
-        
         Kinyerendő mezők: Dokumentum_Tipus, Alvazszam, Rendszam, Vevo_Tulajdonos, Elado, Brutto_Vetelar, Teljesitmeny_kW, Hengerurtartalom_cm3, Elso_forgalomba_helyezes.
         """
         pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
@@ -207,7 +270,6 @@ if check_password():
         for model_name in models_to_try:
             try:
                 model = genai.GenerativeModel(model_name)
-                
                 response = model.generate_content(
                     [prompt, pdf_part],
                     generation_config=genai.GenerationConfig(response_mime_type="application/json")
@@ -218,7 +280,11 @@ if check_password():
                 except Exception as text_e:
                     raise ValueError(f"AI nem adott vissza szöveget: {text_e}")
 
-                raw_json = json.loads(raw_text)
+                # ULTRA STABIL JSON REGEX MEGOLDÁS
+                json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                if not json_match:
+                    raise ValueError("No JSON found in response.")
+                raw_json = json.loads(json_match.group())
                 
                 flat_data = {"low_quality_document": raw_json.get("low_quality_document", False)}
                 for field in EXPECTED_FIELDS:
@@ -231,15 +297,13 @@ if check_password():
                         flat_data[f"{field}_Conf"] = 0
                         
                 return flat_data, ""
-                
             except Exception as e:
                 last_error = str(e)
                 continue
-                
         return None, f"AI Rendszerhiba: {last_error}"
 
     # =========================================================
-    # OLDALSÁV (KÖZÖS)
+    # OLDALSÁV ÉS PIPELINE ... (KÓD TOVÁBBI RÉSZE VÁLTOZATLAN)
     # =========================================================
     with st.sidebar:
         current_user = st.session_state['logged_in_user']
@@ -252,9 +316,6 @@ if check_password():
                 if key in st.session_state: del st.session_state[key]
             st.rerun()
 
-    # =========================================================
-    # FELDOLGOZÓ PIPELINE
-    # =========================================================
     def run_processing_pipeline(uploaded_files):
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
@@ -269,8 +330,6 @@ if check_password():
                 is_valid, error_reason, conf_score = validate_ocr_output(extracted_data)
                 extracted_data["Confidence_Score"] = conf_score
                 
-                # --- A JAVÍTÁS ITT VAN! ---
-                # A "low_quality_document" flag-re már nincs szükségünk a mentéshez, kidobjuk!
                 if "low_quality_document" in extracted_data:
                     del extracted_data["low_quality_document"]
                 
@@ -320,7 +379,7 @@ if check_password():
             col4.metric("AI Hibák", len(df_admin[df_admin["Feldolgozasi_Statusz"] == "Hiba"]))
             st.markdown("<br>", unsafe_allow_html=True)
             
-            tab1, tab2, tab3, tab4 = st.tabs(["📌 Mezős Szintű Analitika", "📌 Hibás/Hiányzó Adatok", "📌 Nyers JSON Hiba", "📈 Field Failure Rate"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Mezős Szintű Analitika", "📌 Hibás/Hiányzó Adatok", "📌 Nyers JSON Hiba", "📈 Field Failure Rate", "🕵️‍♂️ Audit Log"])
             
             with tab1:
                 if not df_errors.empty:
@@ -333,7 +392,7 @@ if check_password():
                 df_json = df_errors[df_errors["Feldolgozasi_Statusz"] == "Hiba"]
                 if not df_json.empty: st.dataframe(df_json[["Alvazszam", "Feldolgozasi_Statusz", "Hiba_Oka"]], use_container_width=True, hide_index=True)
             with tab4:
-                st.markdown("Az alábbi táblázat mutatja, hogy **az összes dokumentum hány százalékánál** volt az adott mező AI magabiztossága 80% alatt.")
+                st.markdown("Melyik mezőnél bizonytalanodik el a legtöbbször az AI?")
                 failure_rates = []
                 for f in EXPECTED_FIELDS:
                     if f"{f}_Conf" in df_admin.columns:
@@ -342,6 +401,16 @@ if check_password():
                 if failure_rates:
                     df_failures = pd.DataFrame(failure_rates).sort_values("Hiba_Arány_%", ascending=False)
                     st.dataframe(df_failures, use_container_width=True, hide_index=True)
+            with tab5:
+                # AUDIT LOG MEGJELENÍTÉSE
+                st.markdown("Kőkemény Compliance: Ki, mikor, mit írt át a mesteradatban?")
+                conn = get_db_connection()
+                df_audit = pd.read_sql_query("SELECT * FROM masterdata_audit ORDER BY id DESC", conn)
+                conn.close()
+                if not df_audit.empty:
+                    st.dataframe(df_audit, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Még nem történt manuális adatfelülírás.")
 
         st.divider()
         st.subheader("1. Kézi dokumentum feldolgozás")
@@ -355,7 +424,7 @@ if check_password():
                 st.dataframe(df_admin, use_container_width=True, hide_index=True)
 
     # =========================================================
-    # 2. ÜZLETI ADMINISZTRÁTOR NÉZET (KÉZI JAVÍTÁS / EDITABLE UI)
+    # 2. ÜZLETI ADMINISZTRÁTOR NÉZET
     # =========================================================
     elif st.session_state["role"] == "adminisztrator":
         st.title("🚗 Flotta Backoffice Vezérlőpult")
@@ -365,9 +434,8 @@ if check_password():
             df_pending = df_admin[df_admin["Feldolgozasi_Statusz"].isin(["Validáció_Szükséges", "Hiba"])].copy()
             if not df_pending.empty:
                 st.error(f"⚠️ {len(df_pending)} tétel manuális javításra szorul!")
-                st.info("Kattints duplán a táblázat celláira a hibás adat javításához! Pipáld be a **Jóváhagyás** oszlopot, majd kattints a Mentés gombra!")
                 
-                cols_to_drop = [c for c in df_pending.columns if c.endswith("_Conf") or c in ["Confidence_Score", "Feltolto_User", "Utolso_Modositas_Ideje"]]
+                cols_to_drop = [c for c in df_pending.columns if c.endswith("_Conf") or c in ["Confidence_Score", "Feltolto_User", "Utolso_Modositas_Ideje", "Modosito_User"]]
                 df_editable = df_pending.drop(columns=cols_to_drop, errors='ignore')
                 df_editable.insert(0, "Jóváhagyás", False)
                 
@@ -380,13 +448,12 @@ if check_password():
                             r_dict = row.to_dict()
                             del r_dict["Jóváhagyás"]
                             r_dict["Feldolgozasi_Statusz"] = "Kész"
-                            r_dict["Hiba_Oka"] = "Admin által manuálisan javítva"
+                            r_dict["Hiba_Oka"] = "Kézi javítás"
+                            r_dict["Modosito_User"] = current_user
                             upsert_record(r_dict)
                         st.success(f"Sikeresen frissítve {len(approved_rows)} tétel!")
                         time.sleep(1)
                         st.rerun()
-                    else:
-                        st.warning("Nincs kijelölve egyetlen sor sem a jóváhagyáshoz.")
 
         st.divider()
         st.subheader("1. Kézi dokumentum feldolgozás")
@@ -408,8 +475,6 @@ if check_password():
                 output_daily = io.BytesIO()
                 with pd.ExcelWriter(output_daily, engine='openpyxl') as writer: df_daily_clean.to_excel(writer, index=False, sheet_name='Napi_Betoltes')
                 st.download_button(label=f"📥 Napi Adatközlő Letöltése", data=output_daily.getvalue(), file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', type="primary")
-            else:
-                st.info("Ma még nem történt sikeres dokumentum-feldolgozás.")
 
     # =========================================================
     # 3. ÜGYFÉL NÉZET
