@@ -72,39 +72,26 @@ if check_password():
     ]
     CONF_FIELDS = [f"{f}_Conf" for f in EXPECTED_FIELDS]
 
-    WEIGHTS = {
-        "Alvazszam": 3,
-        "Dokumentum_Tipus": 2,
-        "Brutto_Vetelar": 2,
-        "Rendszam": 1,
-    }
+    WEIGHTS = {"Alvazszam": 3, "Dokumentum_Tipus": 2, "Brutto_Vetelar": 2, "Rendszam": 1}
 
     # =========================================================
     # EXCEL SZÉPÍTŐ FÜGGVÉNY
     # =========================================================
     def get_formatted_excel(df, sheet_name="Adatok"):
-        """Visszaad egy formázott, szűrőkkel és autosize oszlopokkal ellátott Excel fájlt memóriából."""
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name=sheet_name)
             worksheet = writer.sheets[sheet_name]
-            
-            # Auto-filter bekapcsolása a fejlécre
             worksheet.auto_filter.ref = worksheet.dimensions
-            
-            # Oszlopszélességek automatikus beállítása a tartalomhoz
             from openpyxl.utils import get_column_letter
             for idx, col in enumerate(df.columns, 1):
                 col_letter = get_column_letter(idx)
-                # Kiszámoljuk a leghosszabb cellaértéket az oszlopban, beleértve a fejlécet is
                 max_len = max(df[col].astype(str).map(len).max() if not df[col].empty else 0, len(str(col))) + 2
-                # Beállítjuk a szélességet (max 40 karakterig, hogy ne legyen nevetségesen széles egy hosszú mondattól)
                 worksheet.column_dimensions[col_letter].width = min(max_len, 40)
-                
         return output.getvalue()
 
     # =========================================================
-    # SQLITE ADATBÁZIS RÉTEG (WAL MÓD + AUDIT)
+    # SQLITE ADATBÁZIS RÉTEG (WAL MÓD + AUDIT + TRANZAKCIÓK)
     # =========================================================
     def get_db_connection():
         conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
@@ -114,7 +101,6 @@ if check_password():
     def init_db():
         conn = get_db_connection()
         cursor = conn.cursor()
-        
         columns = [
             "Alvazszam TEXT PRIMARY KEY", "Rendszam TEXT", "Vevo_Tulajdonos TEXT", 
             "Elado TEXT", "Brutto_Vetelar TEXT", "Teljesitmeny_kW TEXT", 
@@ -162,14 +148,15 @@ if check_password():
             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             current_user = st.session_state["logged_in_user"]
             
-            cursor.execute("""
-                INSERT INTO masterdata_audit 
-                (Alvazszam, Field_Name, Old_Value, New_Value, Modified_By, Timestamp) 
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (alvazszam, "RECORD_STATUS", "Létező", "TÖRÖLVE", current_user, timestamp_now))
-            
-            cursor.execute("DELETE FROM masterdata WHERE Alvazszam=?", (alvazszam,))
-            conn.commit()
+            # FIX 2: Atomic Transaction törlésnél
+            with conn:
+                cursor.execute("""
+                    INSERT INTO masterdata_audit 
+                    (Alvazszam, Field_Name, Old_Value, New_Value, Modified_By, Timestamp) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (alvazszam, "RECORD_STATUS", "Létező", "TÖRÖLVE", current_user, timestamp_now))
+                
+                cursor.execute("DELETE FROM masterdata WHERE Alvazszam=?", (alvazszam,))
             return True
         except Exception as e:
             st.error(f"Hiba a törlés során: {e}")
@@ -195,33 +182,38 @@ if check_password():
 
         clean_dict = {k: (str(v) if isinstance(v, (dict, list)) else v) for k, v in new_data_dict.items() if v is not None}
         
+        status = "error"
         try:
-            cursor.execute("SELECT * FROM masterdata WHERE Alvazszam=?", (alvaz,))
-            existing_row = cursor.fetchone()
-            
-            if existing_row:
-                col_names_db = [description[0] for description in cursor.description]
-                existing_dict = dict(zip(col_names_db, existing_row))
+            # FIX 2: Valódi Atomi Tranzakció (with conn)
+            with conn:
+                cursor.execute("SELECT * FROM masterdata WHERE Alvazszam=?", (alvaz,))
+                existing_row = cursor.fetchone()
                 
-                for k, new_v in clean_dict.items():
-                    old_v = existing_dict.get(k)
-                    if k not in ["Utolso_Modositas_Ideje", "Feltolto_User", "Modosito_User"] and str(old_v) != str(new_v):
-                        cursor.execute("""
-                            INSERT INTO masterdata_audit 
-                            (Alvazszam, Field_Name, Old_Value, New_Value, Modified_By, Timestamp) 
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (alvaz, k, str(old_v), str(new_v), current_user, timestamp_now))
+                # FIX 1: Valós Status logika (new vs updated)
+                status = "updated" if existing_row else "new"
+                
+                if existing_row:
+                    col_names_db = [description[0] for description in cursor.description]
+                    existing_dict = dict(zip(col_names_db, existing_row))
+                    
+                    for k, new_v in clean_dict.items():
+                        old_v = existing_dict.get(k)
+                        if k not in ["Utolso_Modositas_Ideje", "Feltolto_User", "Modosito_User"] and str(old_v) != str(new_v):
+                            cursor.execute("""
+                                INSERT INTO masterdata_audit 
+                                (Alvazszam, Field_Name, Old_Value, New_Value, Modified_By, Timestamp) 
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (alvaz, k, str(old_v), str(new_v), current_user, timestamp_now))
 
-            cols = list(clean_dict.keys())
-            vals = [clean_dict[c] for c in cols]
-            placeholders = ", ".join(["?"] * len(cols))
-            col_names = ", ".join(cols)
-            update_clause = ", ".join([f"{c} = excluded.{c}" for c in cols if c != "Alvazszam"])
-            
-            sql = f"INSERT INTO masterdata ({col_names}) VALUES ({placeholders}) ON CONFLICT(Alvazszam) DO UPDATE SET {update_clause}"
-            cursor.execute(sql, vals)
-            conn.commit()
-            status = "upserted"
+                cols = list(clean_dict.keys())
+                vals = [clean_dict[c] for c in cols]
+                placeholders = ", ".join(["?"] * len(cols))
+                col_names = ", ".join(cols)
+                update_clause = ", ".join([f"{c} = excluded.{c}" for c in cols if c != "Alvazszam"])
+                
+                sql = f"INSERT INTO masterdata ({col_names}) VALUES ({placeholders}) ON CONFLICT(Alvazszam) DO UPDATE SET {update_clause}"
+                cursor.execute(sql, vals)
+                
         except Exception as e:
             st.error(f"Adatbázis hiba: {e}")
             status = "error"
@@ -280,7 +272,7 @@ if check_password():
         return True, "", final_score
 
     # =========================================================
-    # AI KINYERÉS
+    # AI KINYERÉS ÉS HASH-ALAPÚ CACHE
     # =========================================================
     @st.cache_data(ttl=3600)
     def get_best_models():
@@ -291,16 +283,10 @@ if check_password():
         except Exception:
             return ['gemini-1.5-flash']
 
-    def process_document_with_gemini(uploaded_file):
-        models_to_try = get_best_models()
-        prompt = """
-        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat szigorúan JSON struktúrában!
-        Minden mezőhöz kötelezően meg kell adnod egy "value" (érték) és egy "confidence" (0-100) párost.
-        EXTRA: Ha a dokumentum nagyon rossz minőségű, homályos vagy nehezen olvasható, állítsd be a "low_quality_document": true értéket a gyökérszinten!
-        Kinyerendő mezők: Dokumentum_Tipus, Alvazszam, Rendszam, Vevo_Tulajdonos, Elado, Brutto_Vetelar, Teljesitmeny_kW, Hengerurtartalom_cm3, Elso_forgalomba_helyezes.
-        """
-        pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
-        
+    # FIX 4: Költségoptimalizált AI Cache (SHA256 hash a háttérben a file_bytes alapján)
+    @st.cache_data(show_spinner=False, ttl=86400) # 24 óráig emlékszik a fájlra!
+    def extract_with_ai_cached(file_bytes, prompt, models_to_try):
+        pdf_part = {"mime_type": "application/pdf", "data": file_bytes}
         last_error = ""
         for model_name in models_to_try:
             try:
@@ -313,9 +299,14 @@ if check_password():
                 try: raw_text = response.text
                 except Exception as text_e: raise ValueError(f"AI nem adott vissza szöveget: {text_e}")
 
-                json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-                if not json_match: raise ValueError("No JSON found in response.")
-                raw_json = json.loads(json_match.group())
+                # FIX 3: Biztonságos JSON extract
+                start_idx = raw_text.find('{')
+                end_idx = raw_text.rfind('}')
+                if start_idx == -1 or end_idx == -1:
+                    raise ValueError("No JSON block found in response.")
+                
+                clean_json_str = raw_text[start_idx : end_idx + 1]
+                raw_json = json.loads(clean_json_str)
                 
                 flat_data = {"low_quality_document": raw_json.get("low_quality_document", False)}
                 for field in EXPECTED_FIELDS:
@@ -332,6 +323,17 @@ if check_password():
                 last_error = str(e)
                 continue
         return None, f"AI Rendszerhiba: {last_error}"
+
+    def process_document_with_gemini(uploaded_file):
+        models_to_try = get_best_models()
+        prompt = """
+        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat szigorúan JSON struktúrában!
+        Minden mezőhöz kötelezően meg kell adnod egy "value" (érték) és egy "confidence" (0-100) párost.
+        EXTRA: Ha a dokumentum nagyon rossz minőségű, homályos vagy nehezen olvasható, állítsd be a "low_quality_document": true értéket a gyökérszinten!
+        Kinyerendő mezők: Dokumentum_Tipus, Alvazszam, Rendszam, Vevo_Tulajdonos, Elado, Brutto_Vetelar, Teljesitmeny_kW, Hengerurtartalom_cm3, Elso_forgalomba_helyezes.
+        """
+        # Hívjuk a CACHE-elt belső függvényt a nyers bájtokkal!
+        return extract_with_ai_cached(uploaded_file.getvalue(), prompt, models_to_try)
 
     # =========================================================
     # OLDALSÁV ÉS PIPELINE
@@ -368,8 +370,9 @@ if check_password():
                     validation_fails += 1
                 
                 status = upsert_record(extracted_data)
+                # FIX 1: Valós status routing a pipeline-ban
                 if status == "new": new_recs += 1
-                elif status == "upserted": updated_recs += 1
+                elif status == "updated": updated_recs += 1
             else:
                 critical_errors += 1
                 upsert_record({"Dokumentum_Tipus": "Ismeretlen", "Feldolgozasi_Statusz": "Hiba", "Hiba_Oka": ai_error_message, "Confidence_Score": 0})
@@ -377,7 +380,7 @@ if check_password():
             progress_bar.progress((i + 1) / len(uploaded_files))
             if i < len(uploaded_files) - 1: time.sleep(1)
 
-        success_msg = f"Feldolgozás befejezve! Új/Frissített: {new_recs + updated_recs} | Kritikus Hiba: {critical_errors}"
+        success_msg = f"Feldolgozás befejezve! Új bejegyzés: {new_recs} | Frissítve: {updated_recs} | Kritikus Hiba: {critical_errors}"
         if validation_fails > 0 or critical_errors > 0: st.warning(f"{success_msg} ⚠️ {validation_fails} dokumentum emberi ellenőrzést igényel!")
         else: st.success(success_msg)
 
@@ -440,19 +443,11 @@ if check_password():
         with st.expander("🗄️ Teljes Master Data"):
             if not df_admin.empty:
                 st.dataframe(df_admin, use_container_width=True, hide_index=True)
-                
-                # ÚJ FUNKCIÓ: Gyönyörű Excel exportáló az Adminnak
                 excel_data = get_formatted_excel(df_admin, sheet_name='Master_Data')
-                st.download_button(
-                    label="📥 Master Data letöltése (.xlsx)", 
-                    data=excel_data, 
-                    file_name='master_data_teljes.xlsx', 
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    type="primary"
-                )
+                st.download_button(label="📥 Master Data letöltése (.xlsx)", data=excel_data, file_name='master_data_teljes.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="primary")
 
     # =========================================================
-    # 2. ÜZLETI ADMINISZTRÁTOR NÉZET (KÉZI JAVÍTÁS & TÖRLÉS)
+    # 2. ÜZLETI ADMINISZTRÁTOR NÉZET
     # =========================================================
     elif st.session_state["role"] == "adminisztrator":
         st.title("🚗 Flotta Backoffice Vezérlőpult")
@@ -520,16 +515,8 @@ if check_password():
             
             if not df_daily_clean.empty:
                 st.success(f"Ma feldolgozott, KÉSZ tételek száma: **{len(df_daily_clean)} db**")
-                
-                # ÚJ FUNKCIÓ: Gyönyörű napi Excel exportáló a Backoffice-nak
                 daily_excel = get_formatted_excel(df_daily_clean, sheet_name='Napi_Betoltes')
-                st.download_button(
-                    label=f"📥 Napi Adatközlő Letöltése (.xlsx)", 
-                    data=daily_excel, 
-                    file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', 
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    type="primary"
-                )
+                st.download_button(label=f"📥 Napi Adatközlő Letöltése (.xlsx)", data=daily_excel, file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="primary")
             else:
                 st.info("Ma még nem történt sikeres dokumentum-feldolgozás.")
                 
@@ -539,16 +526,8 @@ if check_password():
                 cols_to_drop = [c for c in df_admin.columns if c.endswith("_Conf") or c == "Confidence_Score"]
                 df_admin_clean = df_admin.drop(columns=cols_to_drop, errors='ignore')
                 st.dataframe(df_admin_clean, use_container_width=True, hide_index=True)
-                
-                # ÚJ FUNKCIÓ: Gyönyörű "Tiszta" Excel exportáló a Backoffice-nak
                 clean_excel = get_formatted_excel(df_admin_clean, sheet_name='Master_Data')
-                st.download_button(
-                    label="📥 Tiszta Master Data letöltése (.xlsx)", 
-                    data=clean_excel, 
-                    file_name='master_data_tiszta.xlsx', 
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    type="secondary"
-                )
+                st.download_button(label="📥 Tiszta Master Data letöltése (.xlsx)", data=clean_excel, file_name='master_data_tiszta.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="secondary")
 
     # =========================================================
     # 3. ÜGYFÉL NÉZET
