@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 # =========================================================
-# 1. HITELÉSÍTÉSI RENDSZER
+# 1. HITELÉSÍTÉSI RENDSZER (3 SZEREPKÖRREL)
 # =========================================================
 def check_password():
     def password_entered():
@@ -48,7 +48,7 @@ if check_password():
         api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=api_key)
     except KeyError:
-        st.error("Kritikus hiba: API kulcs nem található.")
+        st.error("Kritikus hiba: API kulcs nem található a secrets.toml fájlban.")
         st.stop()
 
     DB_FILE = "fleet.db"
@@ -67,7 +67,7 @@ if check_password():
     }
 
     # =========================================================
-    # SQLITE ADATBÁZIS RÉTEG (JAVÍTOTT OLVASÁSSAL)
+    # SQLITE ADATBÁZIS RÉTEG
     # =========================================================
     def init_db():
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -92,8 +92,7 @@ if check_password():
         df = pd.read_sql_query("SELECT * FROM masterdata", conn)
         conn.close()
         
-        # BIZTONSÁGI JAVÍTÁS: Minden szöveges oszlopot garantáltan szöveggé alakítunk a Pandasban,
-        # így az üres cellák ("NaN") miatt soha többé nem lesz AttributeError!
+        # BIZTONSÁGI JAVÍTÁS: Minden szöveges oszlop garantáltan String lesz
         string_cols = ["Hiba_Oka", "Feldolgozasi_Statusz", "Utolso_Modositas_Ideje", "Dokumentum_Tipus"]
         for col in string_cols:
             if col in df.columns:
@@ -136,7 +135,7 @@ if check_password():
         return status
 
     # =========================================================
-    # VALIDÁCIÓS RÉTEG
+    # VALIDÁCIÓS RÉTEG (SÚLYOZOTT SMART SCORING)
     # =========================================================
     def validate_ocr_output(data):
         errors = []
@@ -182,17 +181,26 @@ if check_password():
         return True, "", final_score
 
     # =========================================================
-    # AI KINYERÉS (HIBÁK LEMENTÉSÉVEL!)
+    # AI KINYERÉS (CACHE-ELT MODELL LISTA + STRICT JSON)
     # =========================================================
+    @st.cache_data(ttl=3600)
+    def get_best_models():
+        try:
+            available = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            preferred = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.5-flash-latest', 'gemini-1.5-pro-latest']
+            return [m for m in preferred if m in available] or (available[:1] if available else ['gemini-1.5-flash'])
+        except Exception:
+            return ['gemini-1.5-flash']
+
     def process_document_with_gemini(uploaded_file):
-        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+        models_to_try = get_best_models()
+        
         prompt = """
-        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat szigorúan JSON struktúrában!
+        Elemezd a dokumentumot (forgalmi vagy számla) és add vissza az adatokat!
         Minden mezőhöz kötelezően meg kell adnod egy "value" (érték) és egy "confidence" (0-100) párost.
         EXTRA: Ha a dokumentum nagyon rossz minőségű, homályos vagy nehezen olvasható, állítsd be a "low_quality_document": true értéket a gyökérszinten!
         
         Kinyerendő mezők: Dokumentum_Tipus, Alvazszam, Rendszam, Vevo_Tulajdonos, Elado, Brutto_Vetelar, Teljesitmeny_kW, Hengerurtartalom_cm3, Elso_forgalomba_helyezes.
-        Csak és kizárólag a nyers JSON-t add vissza!
         """
         pdf_part = {"mime_type": "application/pdf", "data": uploaded_file.getvalue()}
         
@@ -200,21 +208,19 @@ if check_password():
         for model_name in models_to_try:
             try:
                 model = genai.GenerativeModel(model_name)
-                response = model.generate_content([prompt, pdf_part])
+                
+                # STRICT JSON KÉNYSZERÍTÉS API SZINTEN
+                response = model.generate_content(
+                    [prompt, pdf_part],
+                    generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                )
                 
                 try:
                     raw_text = response.text
                 except Exception as text_e:
                     raise ValueError(f"AI nem adott vissza szöveget (Biztonsági blokkolás?): {text_e}")
 
-                clean_text = raw_text.replace('```json', '').replace('```', '').strip()
-                
-                # Megengedőbb JSON keresés
-                json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
-                if json_match:
-                    raw_json = json.loads(json_match.group(0))
-                else:
-                    raw_json = json.loads(clean_text)
+                raw_json = json.loads(raw_text)
                 
                 flat_data = {"low_quality_document": raw_json.get("low_quality_document", False)}
                 for field in EXPECTED_FIELDS:
@@ -232,7 +238,6 @@ if check_password():
                 last_error = str(e)
                 continue
                 
-        # Ha ide eljut, egyik modell sem sikerült. Visszaadjuk a pontos hibaüzenetet!
         return None, f"AI Rendszerhiba: {last_error}"
 
     # =========================================================
@@ -260,7 +265,6 @@ if check_password():
         for i, file in enumerate(uploaded_files):
             status_placeholder.text(f"Státusz: OCR_Feldolgozás_Alatt - {file.name}")
             
-            # FIGYELEM: Most már két értéket kapunk vissza!
             extracted_data, ai_error_message = process_document_with_gemini(file)
             
             if extracted_data:
@@ -278,7 +282,6 @@ if check_password():
                 elif status == "upserted": updated_recs += 1
             else:
                 critical_errors += 1
-                # Lementjük a VALÓDI AI hibát a generikus helyett!
                 upsert_record({
                     "Dokumentum_Tipus": "Ismeretlen", 
                     "Feldolgozasi_Statusz": "Hiba", 
@@ -321,7 +324,6 @@ if check_password():
                     disp_cols = [c for c in ["Alvazszam", "Alvazszam_Conf", "Rendszam", "Rendszam_Conf", "Brutto_Vetelar", "Brutto_Vetelar_Conf", "Hiba_Oka"] if c in df_errors.columns]
                     st.dataframe(df_errors[disp_cols].sort_values(by="Alvazszam_Conf", ascending=True), use_container_width=True, hide_index=True)
             with tab2:
-                # Nincs több AttributeError, mert a load_data() stringgé alakította!
                 df_missing = df_errors[df_errors["Hiba_Oka"].str.contains("Hiányzó|Érvénytelen|Minőség", na=False, case=False)]
                 if not df_missing.empty: st.dataframe(df_missing[["Alvazszam", "Dokumentum_Tipus", "Hiba_Oka", "Confidence_Score"]], use_container_width=True, hide_index=True)
             with tab3:
