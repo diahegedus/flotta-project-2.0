@@ -21,13 +21,11 @@ def check_password():
         if "users" in st.secrets and user in st.secrets["users"]:
             stored_secret = st.secrets["users"][user]["password"]
             
-            # Enterprise szintű Bcrypt validáció (Graceful fallbackkel a demóhoz)
             is_valid = False
             try:
                 if bcrypt.checkpw(pwd.encode('utf-8'), stored_secret.encode('utf-8')):
                     is_valid = True
             except ValueError:
-                # Ha a secrets.toml-ben még sima szöveg van (nem hash), átmenetileg elfogadjuk
                 if pwd == stored_secret:
                     is_valid = True
 
@@ -82,10 +80,33 @@ if check_password():
     }
 
     # =========================================================
-    # SQLITE ADATBÁZIS RÉTEG (WAL MÓD + AUDIT TABLE)
+    # EXCEL SZÉPÍTŐ FÜGGVÉNY
+    # =========================================================
+    def get_formatted_excel(df, sheet_name="Adatok"):
+        """Visszaad egy formázott, szűrőkkel és autosize oszlopokkal ellátott Excel fájlt memóriából."""
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            worksheet = writer.sheets[sheet_name]
+            
+            # Auto-filter bekapcsolása a fejlécre
+            worksheet.auto_filter.ref = worksheet.dimensions
+            
+            # Oszlopszélességek automatikus beállítása a tartalomhoz
+            from openpyxl.utils import get_column_letter
+            for idx, col in enumerate(df.columns, 1):
+                col_letter = get_column_letter(idx)
+                # Kiszámoljuk a leghosszabb cellaértéket az oszlopban, beleértve a fejlécet is
+                max_len = max(df[col].astype(str).map(len).max() if not df[col].empty else 0, len(str(col))) + 2
+                # Beállítjuk a szélességet (max 40 karakterig, hogy ne legyen nevetségesen széles egy hosszú mondattól)
+                worksheet.column_dimensions[col_letter].width = min(max_len, 40)
+                
+        return output.getvalue()
+
+    # =========================================================
+    # SQLITE ADATBÁZIS RÉTEG (WAL MÓD + AUDIT)
     # =========================================================
     def get_db_connection():
-        """Stabil, párhuzamosítást tűrő adatbázis kapcsolat."""
         conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         return conn
@@ -94,7 +115,6 @@ if check_password():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. Fő tábla létrehozása
         columns = [
             "Alvazszam TEXT PRIMARY KEY", "Rendszam TEXT", "Vevo_Tulajdonos TEXT", 
             "Elado TEXT", "Brutto_Vetelar TEXT", "Teljesitmeny_kW TEXT", 
@@ -109,7 +129,6 @@ if check_password():
         try: cursor.execute("ALTER TABLE masterdata ADD COLUMN Modosito_User TEXT")
         except sqlite3.OperationalError: pass
         
-        # 2. AUDIT TÁBLA LÉTREHOZÁSA (Compliance-ready)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS masterdata_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,7 +140,6 @@ if check_password():
                 Timestamp TEXT
             )
         """)
-        
         conn.commit()
         conn.close()
 
@@ -136,6 +154,28 @@ if check_password():
             if col in df.columns:
                 df[col] = df[col].fillna("").astype(str)
         return df
+
+    def delete_record(alvazszam):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            current_user = st.session_state["logged_in_user"]
+            
+            cursor.execute("""
+                INSERT INTO masterdata_audit 
+                (Alvazszam, Field_Name, Old_Value, New_Value, Modified_By, Timestamp) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (alvazszam, "RECORD_STATUS", "Létező", "TÖRÖLVE", current_user, timestamp_now))
+            
+            cursor.execute("DELETE FROM masterdata WHERE Alvazszam=?", (alvazszam,))
+            conn.commit()
+            return True
+        except Exception as e:
+            st.error(f"Hiba a törlés során: {e}")
+            return False
+        finally:
+            conn.close()
 
     def upsert_record(new_data_dict):
         conn = get_db_connection()
@@ -156,7 +196,6 @@ if check_password():
         clean_dict = {k: (str(v) if isinstance(v, (dict, list)) else v) for k, v in new_data_dict.items() if v is not None}
         
         try:
-            # --- AUDIT LOGIKA: Lekérdezzük a régi adatot UPSERT előtt ---
             cursor.execute("SELECT * FROM masterdata WHERE Alvazszam=?", (alvaz,))
             existing_row = cursor.fetchone()
             
@@ -164,10 +203,8 @@ if check_password():
                 col_names_db = [description[0] for description in cursor.description]
                 existing_dict = dict(zip(col_names_db, existing_row))
                 
-                # Összehasonlítjuk és naplózzuk a változásokat
                 for k, new_v in clean_dict.items():
                     old_v = existing_dict.get(k)
-                    # Kihagyjuk a technikai metaadatokat az auditból
                     if k not in ["Utolso_Modositas_Ideje", "Feltolto_User", "Modosito_User"] and str(old_v) != str(new_v):
                         cursor.execute("""
                             INSERT INTO masterdata_audit 
@@ -175,7 +212,6 @@ if check_password():
                             VALUES (?, ?, ?, ?, ?, ?)
                         """, (alvaz, k, str(old_v), str(new_v), current_user, timestamp_now))
 
-            # --- VALÓDI UPSERT ---
             cols = list(clean_dict.keys())
             vals = [clean_dict[c] for c in cols]
             placeholders = ", ".join(["?"] * len(cols))
@@ -195,7 +231,7 @@ if check_password():
         return status
 
     # =========================================================
-    # VALIDÁCIÓS RÉTEG (PRO VIN REGEX + SMART SCORING)
+    # VALIDÁCIÓS RÉTEG
     # =========================================================
     def validate_ocr_output(data):
         errors = []
@@ -224,7 +260,6 @@ if check_password():
         if not alvaz or str(alvaz).lower() == "null":
             errors.append("Hiányzó Alvázszám"); avg_score -= 40; data["Alvazszam_Conf"] = 0
         else:
-            # PROFESSIONAL VIN REGEX (17 karakter, nincs I, O, Q)
             clean_alvaz = str(alvaz).upper().replace(" ", "").replace("-", "")
             VIN_REGEX = r"^[A-HJ-NPR-Z0-9]{17}$"
             if not re.match(VIN_REGEX, clean_alvaz):
@@ -245,7 +280,7 @@ if check_password():
         return True, "", final_score
 
     # =========================================================
-    # AI KINYERÉS (ULTRA STABIL JSON EXTRACT)
+    # AI KINYERÉS
     # =========================================================
     @st.cache_data(ttl=3600)
     def get_best_models():
@@ -275,15 +310,11 @@ if check_password():
                     generation_config=genai.GenerationConfig(response_mime_type="application/json")
                 )
                 
-                try:
-                    raw_text = response.text
-                except Exception as text_e:
-                    raise ValueError(f"AI nem adott vissza szöveget: {text_e}")
+                try: raw_text = response.text
+                except Exception as text_e: raise ValueError(f"AI nem adott vissza szöveget: {text_e}")
 
-                # ULTRA STABIL JSON REGEX MEGOLDÁS
                 json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-                if not json_match:
-                    raise ValueError("No JSON found in response.")
+                if not json_match: raise ValueError("No JSON found in response.")
                 raw_json = json.loads(json_match.group())
                 
                 flat_data = {"low_quality_document": raw_json.get("low_quality_document", False)}
@@ -303,7 +334,7 @@ if check_password():
         return None, f"AI Rendszerhiba: {last_error}"
 
     # =========================================================
-    # OLDALSÁV ÉS PIPELINE ... (KÓD TOVÁBBI RÉSZE VÁLTOZATLAN)
+    # OLDALSÁV ÉS PIPELINE
     # =========================================================
     with st.sidebar:
         current_user = st.session_state['logged_in_user']
@@ -323,15 +354,12 @@ if check_password():
 
         for i, file in enumerate(uploaded_files):
             status_placeholder.text(f"Státusz: OCR_Feldolgozás_Alatt - {file.name}")
-            
             extracted_data, ai_error_message = process_document_with_gemini(file)
             
             if extracted_data:
                 is_valid, error_reason, conf_score = validate_ocr_output(extracted_data)
                 extracted_data["Confidence_Score"] = conf_score
-                
-                if "low_quality_document" in extracted_data:
-                    del extracted_data["low_quality_document"]
+                if "low_quality_document" in extracted_data: del extracted_data["low_quality_document"]
                 
                 if is_valid:
                     extracted_data["Feldolgozasi_Statusz"] = "Kész"; extracted_data["Hiba_Oka"] = ""
@@ -344,21 +372,14 @@ if check_password():
                 elif status == "upserted": updated_recs += 1
             else:
                 critical_errors += 1
-                upsert_record({
-                    "Dokumentum_Tipus": "Ismeretlen", 
-                    "Feldolgozasi_Statusz": "Hiba", 
-                    "Hiba_Oka": ai_error_message, 
-                    "Confidence_Score": 0
-                })
+                upsert_record({"Dokumentum_Tipus": "Ismeretlen", "Feldolgozasi_Statusz": "Hiba", "Hiba_Oka": ai_error_message, "Confidence_Score": 0})
             
             progress_bar.progress((i + 1) / len(uploaded_files))
             if i < len(uploaded_files) - 1: time.sleep(1)
 
         success_msg = f"Feldolgozás befejezve! Új/Frissített: {new_recs + updated_recs} | Kritikus Hiba: {critical_errors}"
-        if validation_fails > 0 or critical_errors > 0:
-            st.warning(f"{success_msg} ⚠️ {validation_fails} dokumentum emberi ellenőrzést igényel!")
-        else:
-            st.success(success_msg)
+        if validation_fails > 0 or critical_errors > 0: st.warning(f"{success_msg} ⚠️ {validation_fails} dokumentum emberi ellenőrzést igényel!")
+        else: st.success(success_msg)
 
     # =========================================================
     # 1. RENDSZER ADMIN NÉZET
@@ -402,15 +423,12 @@ if check_password():
                     df_failures = pd.DataFrame(failure_rates).sort_values("Hiba_Arány_%", ascending=False)
                     st.dataframe(df_failures, use_container_width=True, hide_index=True)
             with tab5:
-                # AUDIT LOG MEGJELENÍTÉSE
-                st.markdown("Kőkemény Compliance: Ki, mikor, mit írt át a mesteradatban?")
+                st.markdown("Ki, mikor, mit írt át vagy törölt a mesteradatban?")
                 conn = get_db_connection()
                 df_audit = pd.read_sql_query("SELECT * FROM masterdata_audit ORDER BY id DESC", conn)
                 conn.close()
-                if not df_audit.empty:
-                    st.dataframe(df_audit, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Még nem történt manuális adatfelülírás.")
+                if not df_audit.empty: st.dataframe(df_audit, use_container_width=True, hide_index=True)
+                else: st.info("Még nem történt manuális adatfelülírás vagy törlés.")
 
         st.divider()
         st.subheader("1. Kézi dokumentum feldolgozás")
@@ -422,9 +440,19 @@ if check_password():
         with st.expander("🗄️ Teljes Master Data"):
             if not df_admin.empty:
                 st.dataframe(df_admin, use_container_width=True, hide_index=True)
+                
+                # ÚJ FUNKCIÓ: Gyönyörű Excel exportáló az Adminnak
+                excel_data = get_formatted_excel(df_admin, sheet_name='Master_Data')
+                st.download_button(
+                    label="📥 Master Data letöltése (.xlsx)", 
+                    data=excel_data, 
+                    file_name='master_data_teljes.xlsx', 
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type="primary"
+                )
 
     # =========================================================
-    # 2. ÜZLETI ADMINISZTRÁTOR NÉZET
+    # 2. ÜZLETI ADMINISZTRÁTOR NÉZET (KÉZI JAVÍTÁS & TÖRLÉS)
     # =========================================================
     elif st.session_state["role"] == "adminisztrator":
         st.title("🚗 Flotta Backoffice Vezérlőpult")
@@ -433,27 +461,47 @@ if check_password():
         if not df_admin.empty:
             df_pending = df_admin[df_admin["Feldolgozasi_Statusz"].isin(["Validáció_Szükséges", "Hiba"])].copy()
             if not df_pending.empty:
-                st.error(f"⚠️ {len(df_pending)} tétel manuális javításra szorul!")
+                st.error(f"⚠️ {len(df_pending)} tétel manuális javításra vagy törlésre szorul!")
+                st.info("Kattints duplán a cellákra a javításhoz, majd pipáld be a **Jóváhagyás** oszlopot a mentéshez! Hibás feltöltés esetén használd a **Törlés** oszlopot.")
                 
                 cols_to_drop = [c for c in df_pending.columns if c.endswith("_Conf") or c in ["Confidence_Score", "Feltolto_User", "Utolso_Modositas_Ideje", "Modosito_User"]]
                 df_editable = df_pending.drop(columns=cols_to_drop, errors='ignore')
+                
                 df_editable.insert(0, "Jóváhagyás", False)
+                df_editable.insert(1, "Törlés", False)
                 
                 edited_df = st.data_editor(df_editable, hide_index=True, use_container_width=True, key="data_editor")
                 
-                if st.button("✅ Kijelölt sorok Mentése és Készre állítása", type="primary"):
-                    approved_rows = edited_df[edited_df["Jóváhagyás"] == True]
-                    if not approved_rows.empty:
-                        for _, row in approved_rows.iterrows():
-                            r_dict = row.to_dict()
-                            del r_dict["Jóváhagyás"]
-                            r_dict["Feldolgozasi_Statusz"] = "Kész"
-                            r_dict["Hiba_Oka"] = "Kézi javítás"
-                            r_dict["Modosito_User"] = current_user
-                            upsert_record(r_dict)
-                        st.success(f"Sikeresen frissítve {len(approved_rows)} tétel!")
-                        time.sleep(1)
-                        st.rerun()
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("✅ Kijelölt sorok Mentése", type="primary"):
+                        approved_rows = edited_df[(edited_df["Jóváhagyás"] == True) & (edited_df["Törlés"] == False)]
+                        if not approved_rows.empty:
+                            for _, row in approved_rows.iterrows():
+                                r_dict = row.to_dict()
+                                del r_dict["Jóváhagyás"]
+                                del r_dict["Törlés"]
+                                r_dict["Feldolgozasi_Statusz"] = "Kész"
+                                r_dict["Hiba_Oka"] = "Kézi javítás"
+                                r_dict["Modosito_User"] = current_user
+                                upsert_record(r_dict)
+                            st.success(f"Sikeresen frissítve {len(approved_rows)} tétel!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.warning("Nincs kijelölve egyetlen sor sem a jóváhagyáshoz.")
+
+                with col2:
+                    if st.button("🗑️ Kijelölt sorok Törlése", type="secondary"):
+                        to_delete_rows = edited_df[edited_df["Törlés"] == True]
+                        if not to_delete_rows.empty:
+                            for _, row in to_delete_rows.iterrows():
+                                delete_record(row["Alvazszam"])
+                            st.success(f"Sikeresen törölve {len(to_delete_rows)} tétel az adatbázisból!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.warning("Nincs kijelölve egyetlen sor sem a törléshez.")
 
         st.divider()
         st.subheader("1. Kézi dokumentum feldolgozás")
@@ -472,9 +520,35 @@ if check_password():
             
             if not df_daily_clean.empty:
                 st.success(f"Ma feldolgozott, KÉSZ tételek száma: **{len(df_daily_clean)} db**")
-                output_daily = io.BytesIO()
-                with pd.ExcelWriter(output_daily, engine='openpyxl') as writer: df_daily_clean.to_excel(writer, index=False, sheet_name='Napi_Betoltes')
-                st.download_button(label=f"📥 Napi Adatközlő Letöltése", data=output_daily.getvalue(), file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', type="primary")
+                
+                # ÚJ FUNKCIÓ: Gyönyörű napi Excel exportáló a Backoffice-nak
+                daily_excel = get_formatted_excel(df_daily_clean, sheet_name='Napi_Betoltes')
+                st.download_button(
+                    label=f"📥 Napi Adatközlő Letöltése (.xlsx)", 
+                    data=daily_excel, 
+                    file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', 
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type="primary"
+                )
+            else:
+                st.info("Ma még nem történt sikeres dokumentum-feldolgozás.")
+                
+        st.divider()
+        with st.expander("🗄️ Tiszta Master Data"):
+            if not df_admin.empty:
+                cols_to_drop = [c for c in df_admin.columns if c.endswith("_Conf") or c == "Confidence_Score"]
+                df_admin_clean = df_admin.drop(columns=cols_to_drop, errors='ignore')
+                st.dataframe(df_admin_clean, use_container_width=True, hide_index=True)
+                
+                # ÚJ FUNKCIÓ: Gyönyörű "Tiszta" Excel exportáló a Backoffice-nak
+                clean_excel = get_formatted_excel(df_admin_clean, sheet_name='Master_Data')
+                st.download_button(
+                    label="📥 Tiszta Master Data letöltése (.xlsx)", 
+                    data=clean_excel, 
+                    file_name='master_data_tiszta.xlsx', 
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type="secondary"
+                )
 
     # =========================================================
     # 3. ÜGYFÉL NÉZET
