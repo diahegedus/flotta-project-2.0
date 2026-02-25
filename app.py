@@ -75,19 +75,47 @@ if check_password():
     WEIGHTS = {"Alvazszam": 3, "Dokumentum_Tipus": 2, "Brutto_Vetelar": 2, "Rendszam": 1}
 
     # =========================================================
-    # EXCEL SZÉPÍTŐ FÜGGVÉNY
+    # EXCEL SZÉPÍTŐ FÜGGVÉNY (JAVÍTOTT, BIZTONSÁGOS VERZIÓ)
     # =========================================================
     def get_formatted_excel(df, sheet_name="Adatok"):
+        import re
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
-            worksheet = writer.sheets[sheet_name]
-            worksheet.auto_filter.ref = worksheet.dimensions
-            from openpyxl.utils import get_column_letter
-            for idx, col in enumerate(df.columns, 1):
-                col_letter = get_column_letter(idx)
-                max_len = max(df[col].astype(str).map(len).max() if not df[col].empty else 0, len(str(col))) + 2
-                worksheet.column_dimensions[col_letter].width = min(max_len, 40)
+        
+        # 1. Illegalis Excel karakterek eltávolítása (gyakori OCR hiba)
+        ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
+        
+        clean_df = df.copy()
+        for col in clean_df.select_dtypes(include=['object', 'string']):
+            clean_df[col] = clean_df[col].apply(
+                lambda x: ILLEGAL_CHARACTERS_RE.sub('', str(x)) if pd.notnull(x) else x
+            )
+
+        try:
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                clean_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                worksheet = writer.sheets[sheet_name]
+                
+                if not clean_df.empty:
+                    worksheet.auto_filter.ref = worksheet.dimensions
+                    
+                from openpyxl.utils import get_column_letter
+                for idx, col in enumerate(clean_df.columns, 1):
+                    col_letter = get_column_letter(idx)
+                    try:
+                        # Biztonságos oszlopszélesség számítás
+                        if not clean_df.empty and clean_df[col].notna().any():
+                            max_len = max(clean_df[col].astype(str).map(len).max(), len(str(col))) + 2
+                        else:
+                            max_len = len(str(col)) + 2
+                            
+                        worksheet.column_dimensions[col_letter].width = min(max_len, 40)
+                    except Exception:
+                        pass # Ha gond van a formázással, hagyjuk alapértelmezetten
+                        
+        except Exception as e:
+            st.error(f"❌ Rendszerhiba az Excel generálásakor: {e}")
+            return None
+
         return output.getvalue()
 
     # =========================================================
@@ -148,7 +176,6 @@ if check_password():
             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             current_user = st.session_state["logged_in_user"]
             
-            # FIX 2: Atomic Transaction törlésnél
             with conn:
                 cursor.execute("""
                     INSERT INTO masterdata_audit 
@@ -184,12 +211,10 @@ if check_password():
         
         status = "error"
         try:
-            # FIX 2: Valódi Atomi Tranzakció (with conn)
             with conn:
                 cursor.execute("SELECT * FROM masterdata WHERE Alvazszam=?", (alvaz,))
                 existing_row = cursor.fetchone()
                 
-                # FIX 1: Valós Status logika (new vs updated)
                 status = "updated" if existing_row else "new"
                 
                 if existing_row:
@@ -283,8 +308,7 @@ if check_password():
         except Exception:
             return ['gemini-1.5-flash']
 
-    # FIX 4: Költségoptimalizált AI Cache (SHA256 hash a háttérben a file_bytes alapján)
-    @st.cache_data(show_spinner=False, ttl=86400) # 24 óráig emlékszik a fájlra!
+    @st.cache_data(show_spinner=False, ttl=86400)
     def extract_with_ai_cached(file_bytes, prompt, models_to_try):
         pdf_part = {"mime_type": "application/pdf", "data": file_bytes}
         last_error = ""
@@ -299,7 +323,6 @@ if check_password():
                 try: raw_text = response.text
                 except Exception as text_e: raise ValueError(f"AI nem adott vissza szöveget: {text_e}")
 
-                # FIX 3: Biztonságos JSON extract
                 start_idx = raw_text.find('{')
                 end_idx = raw_text.rfind('}')
                 if start_idx == -1 or end_idx == -1:
@@ -332,7 +355,6 @@ if check_password():
         EXTRA: Ha a dokumentum nagyon rossz minőségű, homályos vagy nehezen olvasható, állítsd be a "low_quality_document": true értéket a gyökérszinten!
         Kinyerendő mezők: Dokumentum_Tipus, Alvazszam, Rendszam, Vevo_Tulajdonos, Elado, Brutto_Vetelar, Teljesitmeny_kW, Hengerurtartalom_cm3, Elso_forgalomba_helyezes.
         """
-        # Hívjuk a CACHE-elt belső függvényt a nyers bájtokkal!
         return extract_with_ai_cached(uploaded_file.getvalue(), prompt, models_to_try)
 
     # =========================================================
@@ -370,7 +392,6 @@ if check_password():
                     validation_fails += 1
                 
                 status = upsert_record(extracted_data)
-                # FIX 1: Valós status routing a pipeline-ban
                 if status == "new": new_recs += 1
                 elif status == "updated": updated_recs += 1
             else:
@@ -444,7 +465,8 @@ if check_password():
             if not df_admin.empty:
                 st.dataframe(df_admin, use_container_width=True, hide_index=True)
                 excel_data = get_formatted_excel(df_admin, sheet_name='Master_Data')
-                st.download_button(label="📥 Master Data letöltése (.xlsx)", data=excel_data, file_name='master_data_teljes.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="primary")
+                if excel_data:
+                    st.download_button(label="📥 Master Data letöltése (.xlsx)", data=excel_data, file_name='master_data_teljes.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="primary")
 
     # =========================================================
     # 2. ÜZLETI ADMINISZTRÁTOR NÉZET
@@ -516,7 +538,8 @@ if check_password():
             if not df_daily_clean.empty:
                 st.success(f"Ma feldolgozott, KÉSZ tételek száma: **{len(df_daily_clean)} db**")
                 daily_excel = get_formatted_excel(df_daily_clean, sheet_name='Napi_Betoltes')
-                st.download_button(label=f"📥 Napi Adatközlő Letöltése (.xlsx)", data=daily_excel, file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="primary")
+                if daily_excel:
+                    st.download_button(label=f"📥 Napi Adatközlő Letöltése (.xlsx)", data=daily_excel, file_name=f'Biztosito_Betoltes_{today_str.replace("-", "")}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="primary")
             else:
                 st.info("Ma még nem történt sikeres dokumentum-feldolgozás.")
                 
@@ -527,7 +550,8 @@ if check_password():
                 df_admin_clean = df_admin.drop(columns=cols_to_drop, errors='ignore')
                 st.dataframe(df_admin_clean, use_container_width=True, hide_index=True)
                 clean_excel = get_formatted_excel(df_admin_clean, sheet_name='Master_Data')
-                st.download_button(label="📥 Tiszta Master Data letöltése (.xlsx)", data=clean_excel, file_name='master_data_tiszta.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="secondary")
+                if clean_excel:
+                    st.download_button(label="📥 Tiszta Master Data letöltése (.xlsx)", data=clean_excel, file_name='master_data_tiszta.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type="secondary")
 
     # =========================================================
     # 3. ÜGYFÉL NÉZET
